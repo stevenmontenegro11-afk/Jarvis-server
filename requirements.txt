@@ -1,1 +1,3 @@
-fastapi\nuvicorn[standard]\nopenai\n
+fastapi
+uvicorn[standard]
+openai
