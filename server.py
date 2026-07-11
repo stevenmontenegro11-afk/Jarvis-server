@@ -7,8 +7,8 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from server_jobs import router as jobs_router
-
 app = FastAPI(title="Jarvis Server", version="1.1.0")
+app.include_router(jobs_router)
 
 TEXT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6")
 client = OpenAI()
