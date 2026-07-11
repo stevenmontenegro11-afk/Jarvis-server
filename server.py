@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -14,7 +15,7 @@ DB_PATH = APP_DIR / "jarvis_memory.db"
 TEXT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6")
 IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
 
-app = FastAPI(title="Jarvis Cloud Baseline", version="1.0.0")
+app = FastAPI(title="Jarvis Cloud Baseline", version="1.0.1")
 client = OpenAI()
 
 
@@ -72,10 +73,7 @@ def load_messages(conversation_id: str, limit: int = 40) -> list[dict[str, str]]
             (conversation_id, limit),
         ).fetchall()
 
-    return [
-        {"role": role, "content": content}
-        for role, content in reversed(rows)
-    ]
+    return [{"role": role, "content": content} for role, content in reversed(rows)]
 
 
 def looks_like_image_request(text: str) -> bool:
@@ -92,6 +90,35 @@ def looks_like_image_request(text: str) -> bool:
     return any(phrase in lowered for phrase in phrases)
 
 
+def looks_current_or_live(text: str) -> bool:
+    lowered = text.lower()
+    terms = (
+        "today",
+        "yesterday",
+        "tomorrow",
+        "latest",
+        "current",
+        "right now",
+        "live",
+        "score",
+        "won",
+        "weather",
+        "news",
+        "price",
+        "schedule",
+        "game",
+        "match",
+        "ufc",
+        "soccer",
+        "football",
+        "nba",
+        "nfl",
+        "mlb",
+        "nhl",
+    )
+    return any(term in lowered for term in terms)
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -103,6 +130,7 @@ def health() -> dict[str, str]:
         "status": "ok",
         "text_model": TEXT_MODEL,
         "image_model": IMAGE_MODEL,
+        "utc_date": datetime.now(timezone.utc).date().isoformat(),
     }
 
 
@@ -141,15 +169,23 @@ def chat(request: ChatRequest) -> ChatResponse:
             )
 
         history = load_messages(conversation_id)
-        tools = [{"type": "web_search"}] if request.mode in ("auto", "web") else []
+        today_utc = datetime.now(timezone.utc).date().isoformat()
+        should_search = request.mode == "web" or (
+            request.mode == "auto" and looks_current_or_live(latest)
+        )
+        tools = [{"type": "web_search"}] if should_search else []
 
         response = client.responses.create(
             model=TEXT_MODEL,
             instructions=(
-                "You are Jarvis, Steven's personal AI assistant. "
-                "Be practical and conversational. Use web search for current facts "
-                "when it is available and needed. Never claim an external action "
-                "was completed unless a connected tool actually completed it."
+                f"You are Jarvis, Steven's personal AI assistant. "
+                f"Today's UTC date is {today_utc}. "
+                "For questions about today, yesterday, current events, sports, scores, "
+                "schedules, prices, weather, or news, use web search before answering. "
+                "Never invent a date or current result. "
+                "If the request is genuinely ambiguous, ask one concise clarifying question. "
+                "Be practical and conversational. "
+                "Never claim an external action was completed unless a connected tool actually completed it."
             ),
             input=history,
             tools=tools,
