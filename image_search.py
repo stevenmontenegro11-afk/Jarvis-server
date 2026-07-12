@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -11,14 +12,13 @@ import requests
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, HttpUrl, ValidationError
 
-
 router = APIRouter(tags=["image-search"])
 
 OPENVERSE_URL = "https://api.openverse.org/v1/images/"
 WIKIMEDIA_URL = "https://commons.wikimedia.org/w/api.php"
 
 HEADERS = {
-    "User-Agent": "JarvisImageSearch/1.2 (+https://github.com/)"
+    "User-Agent": "JarvisImageSearch/1.3 (+https://github.com/)"
 }
 
 CONNECT_TIMEOUT_SECONDS = 3.05
@@ -33,30 +33,44 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 QUERY_FILLER_WORDS = frozenset(
     {
         "a",
+        "about",
         "an",
         "and",
         "at",
         "by",
+        "can",
+        "could",
+        "display",
         "for",
         "find",
         "from",
+        "get",
         "give",
+        "i",
         "image",
         "images",
         "in",
+        "look",
+        "looking",
         "me",
         "of",
         "on",
         "or",
         "photo",
+        "photograph",
+        "photographs",
         "photos",
         "picture",
         "pictures",
         "please",
         "search",
+        "see",
         "show",
         "the",
         "to",
+        "want",
+        "would",
+        "you",
         "with",
     }
 )
@@ -105,7 +119,6 @@ def meaningful_query_terms(query: str) -> list[str]:
 
     unique_terms: list[str] = []
     seen: set[str] = set()
-
     for term in selected_terms:
         if term not in seen:
             seen.add(term)
@@ -164,25 +177,9 @@ def token_variants(token: str) -> set[str]:
 
 def query_term_matches_metadata(term: str, metadata_words: set[str]) -> bool:
     term_variants = token_variants(term)
-
-    for metadata_word in metadata_words:
-        if term_variants.intersection(token_variants(metadata_word)):
-            return True
-
-    return False
-
-
-def metadata_matches_query(metadata_text: str, query_words: set[str]) -> bool:
-    if not query_words:
-        return False
-
-    metadata_words = normalize_tokens(metadata_text)
-    if not metadata_words:
-        return False
-
-    return all(
-        query_term_matches_metadata(term, metadata_words)
-        for term in query_words
+    return any(
+        term_variants.intersection(token_variants(metadata_word))
+        for metadata_word in metadata_words
     )
 
 
@@ -199,29 +196,39 @@ def relevance_score(candidate: dict[str, Any], query_terms: list[str]) -> int | 
     if not query_terms:
         return None
 
-    metadata_text = candidate.get("metadata_text", "")
-    if not metadata_matches_query(metadata_text, set(query_terms)):
+    metadata_text = str(candidate.get("metadata_text", ""))
+    metadata_matches = matching_term_count(metadata_text, query_terms)
+    minimum_matches = max(1, math.ceil(len(query_terms) * 0.6))
+
+    if metadata_matches < minimum_matches:
         return None
 
-    title_text = candidate.get("title_text", "")
-    tag_text = candidate.get("tag_text", "")
-    description_text = candidate.get("description_text", "")
-    creator_text = candidate.get("creator_text", "")
+    title_text = str(candidate.get("title_text", ""))
+    tag_text = str(candidate.get("tag_text", ""))
+    description_text = str(candidate.get("description_text", ""))
+    creator_text = str(candidate.get("creator_text", ""))
 
-    score = len(query_terms)
-    score += matching_term_count(title_text, query_terms) * 12
-    score += matching_term_count(tag_text, query_terms) * 7
-    score += matching_term_count(description_text, query_terms) * 4
-    score += matching_term_count(creator_text, query_terms) * 2
+    title_matches = matching_term_count(title_text, query_terms)
+    tag_matches = matching_term_count(tag_text, query_terms)
+    description_matches = matching_term_count(description_text, query_terms)
+    creator_matches = matching_term_count(creator_text, query_terms)
+
+    score = metadata_matches * 3
+    score += title_matches * 15
+    score += tag_matches * 8
+    score += description_matches * 5
+    score += creator_matches * 2
 
     normalized_title = normalized_token_list(title_text)
-    if query_terms and all(term in normalized_title for term in query_terms):
-        score += 10
-
     query_phrase = " ".join(query_terms)
     title_phrase = " ".join(normalized_title)
+
+    if metadata_matches == len(query_terms):
+        score += 15
+    if query_terms and all(term in normalized_title for term in query_terms):
+        score += 15
     if query_phrase and query_phrase in title_phrase:
-        score += 25
+        score += 30
 
     return score
 
@@ -238,6 +245,7 @@ def payload_looks_like_image(payload: bytes) -> bool:
         or payload.startswith(b"BM")
         or payload.startswith(b"RIFF") and payload[8:12] == b"WEBP"
         or b"<svg" in lowered
+        or b"<svg" in stripped[:2048].lower()
     )
 
 
@@ -246,7 +254,6 @@ def url_is_working_image(url: str) -> bool:
         return False
 
     response: requests.Response | None = None
-
     try:
         response = requests.get(
             url,
@@ -255,7 +262,6 @@ def url_is_working_image(url: str) -> bool:
             stream=True,
             allow_redirects=True,
         )
-
         if response.status_code != 200:
             return False
 
@@ -263,7 +269,7 @@ def url_is_working_image(url: str) -> bool:
         if content_type.startswith("image/"):
             return True
 
-        first_chunk = next(response.iter_content(chunk_size=512), b"")
+        first_chunk = next(response.iter_content(chunk_size=2048), b"")
         return payload_looks_like_image(first_chunk)
     except (requests.RequestException, OSError):
         return False
@@ -296,7 +302,6 @@ def search_openverse(query: str, limit: int) -> list[dict[str, Any]]:
         return []
 
     results: list[dict[str, Any]] = []
-
     for provider_rank, item in enumerate(provider_results):
         if not isinstance(item, dict):
             continue
@@ -304,7 +309,6 @@ def search_openverse(query: str, limit: int) -> list[dict[str, Any]]:
         image_url = item.get("url")
         source_page = item.get("foreign_landing_url")
         thumbnail = item.get("thumbnail")
-
         if not isinstance(image_url, str) or not isinstance(source_page, str):
             continue
 
@@ -333,19 +337,16 @@ def search_openverse(query: str, limit: int) -> list[dict[str, Any]]:
                 "image_url": image_url,
                 "thumbnail_url": thumbnail if isinstance(thumbnail, str) else None,
                 "source_page_url": source_page,
-                "source_name": (
-                    str(source_value) if source_value else "Openverse"
-                ),
+                "source_name": str(source_value) if source_value else "Openverse",
                 "creator": creator if isinstance(creator, str) else None,
-                "license": (
-                    str(license_value) if license_value is not None else None
-                ),
+                "license": str(license_value) if license_value is not None else None,
                 "metadata_text": metadata_text,
                 "title_text": title_text,
                 "tag_text": tag_text,
                 "description_text": description_text,
                 "creator_text": creator_text,
                 "provider_rank": provider_rank,
+                "provider_priority": 1,
             }
         )
 
@@ -359,7 +360,6 @@ def metadata_field(extmetadata: Any, field_name: str) -> Any:
     field = extmetadata.get(field_name)
     if isinstance(field, dict) and "value" in field:
         return field.get("value")
-
     return field
 
 
@@ -421,8 +421,11 @@ def search_wikimedia(query: str, limit: int) -> list[dict[str, Any]]:
         image_url = info.get("url")
         thumbnail_url = info.get("thumburl") or image_url
         source_page = info.get("descriptionurl")
+        mime_type = str(info.get("mime", "")).lower()
 
         if not isinstance(image_url, str) or not isinstance(source_page, str):
+            continue
+        if mime_type and not mime_type.startswith("image/"):
             continue
 
         raw_title = page.get("title") or query
@@ -454,18 +457,15 @@ def search_wikimedia(query: str, limit: int) -> list[dict[str, Any]]:
         license_name = build_metadata_text(
             metadata_field(extmetadata, "LicenseShortName")
         ) or None
-        creator_name = creator or None
 
         results.append(
             {
                 "title": title,
                 "image_url": image_url,
-                "thumbnail_url": (
-                    thumbnail_url if isinstance(thumbnail_url, str) else image_url
-                ),
+                "thumbnail_url": thumbnail_url if isinstance(thumbnail_url, str) else image_url,
                 "source_page_url": source_page,
                 "source_name": "Wikimedia Commons",
-                "creator": creator_name,
+                "creator": creator or None,
                 "license": license_name,
                 "metadata_text": metadata_text,
                 "title_text": title_text,
@@ -473,6 +473,7 @@ def search_wikimedia(query: str, limit: int) -> list[dict[str, Any]]:
                 "description_text": description,
                 "creator_text": creator,
                 "provider_rank": page.get("index", fallback_rank),
+                "provider_priority": 0,
             }
         )
 
@@ -486,11 +487,7 @@ def run_provider_searches(query: str, limit: int) -> list[dict[str, Any]]:
     )
 
     with ThreadPoolExecutor(max_workers=len(providers)) as executor:
-        futures = [
-            executor.submit(provider, query, limit)
-            for provider in providers
-        ]
-
+        futures = [executor.submit(provider, query, limit) for provider in providers]
         results: list[dict[str, Any]] = []
         for future in futures:
             try:
@@ -505,7 +502,6 @@ def run_provider_searches(query: str, limit: int) -> list[dict[str, Any]]:
 def verify_candidate(candidate: dict[str, Any]) -> ImageResult | None:
     original_url = candidate.get("image_url")
     thumbnail_url = candidate.get("thumbnail_url")
-
     if not isinstance(original_url, str):
         return None
 
@@ -520,10 +516,7 @@ def verify_candidate(candidate: dict[str, Any]) -> ImageResult | None:
     if working_url is None:
         return None
 
-    result_data = {
-        field: candidate.get(field)
-        for field in IMAGE_RESULT_FIELDS
-    }
+    result_data = {field: candidate.get(field) for field in IMAGE_RESULT_FIELDS}
     result_data["image_url"] = working_url
     result_data["thumbnail_url"] = working_url
 
@@ -531,6 +524,64 @@ def verify_candidate(candidate: dict[str, Any]) -> ImageResult | None:
         return ImageResult(**result_data)
     except ValidationError:
         return None
+
+
+def search_images(query: str, limit: int = 5) -> list[ImageResult]:
+    cleaned_query = query.strip()
+    if not cleaned_query or limit < 1:
+        return []
+
+    safe_limit = min(limit, 10)
+    query_terms = meaningful_query_terms(cleaned_query)
+    provider_query = " ".join(query_terms) or cleaned_query
+    candidates = run_provider_searches(provider_query, safe_limit)
+
+    relevant_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        score = relevance_score(candidate, query_terms)
+        if score is None:
+            continue
+        candidate["relevance_score"] = score
+        relevant_candidates.append(candidate)
+
+    relevant_candidates.sort(
+        key=lambda candidate: (
+            -candidate["relevance_score"],
+            candidate.get("provider_priority", 10),
+            candidate.get("provider_rank", 1_000_000),
+        )
+    )
+
+    unique_candidates: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    verification_limit = max(safe_limit * 3, 12)
+
+    for candidate in relevant_candidates:
+        image_url = candidate.get("image_url")
+        thumbnail_url = candidate.get("thumbnail_url")
+        identity_url = thumbnail_url if isinstance(thumbnail_url, str) else image_url
+        if not isinstance(identity_url, str) or identity_url in seen_urls:
+            continue
+
+        seen_urls.add(identity_url)
+        unique_candidates.append(candidate)
+        if len(unique_candidates) >= verification_limit:
+            break
+
+    if not unique_candidates:
+        return []
+
+    verified: list[ImageResult] = []
+    worker_count = min(MAX_VERIFICATION_WORKERS, len(unique_candidates))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for result in executor.map(verify_candidate, unique_candidates):
+            if result is None:
+                continue
+            verified.append(result)
+            if len(verified) >= safe_limit:
+                break
+
+    return verified
 
 
 @router.get(
@@ -542,66 +593,13 @@ def image_search(
     limit: int = Query(default=5, ge=1, le=10),
 ):
     query = q.strip()
-
     if not query:
         raise HTTPException(
             status_code=400,
             detail="Image search query cannot be empty.",
         )
 
-    query_terms = meaningful_query_terms(query)
-    provider_query = " ".join(query_terms) or query
-    candidates = run_provider_searches(provider_query, limit)
-
-    relevant_candidates: list[dict[str, Any]] = []
-
-    for candidate in candidates:
-        score = relevance_score(candidate, query_terms)
-        if score is None:
-            continue
-
-        candidate["relevance_score"] = score
-        relevant_candidates.append(candidate)
-
-    relevant_candidates.sort(
-        key=lambda candidate: (
-            -candidate["relevance_score"],
-            candidate.get("provider_rank", 1_000_000),
-        )
-    )
-
-    unique_candidates: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
-    verification_limit = max(limit * 2, 10)
-
-    for candidate in relevant_candidates:
-        image_url = candidate.get("image_url")
-        thumbnail_url = candidate.get("thumbnail_url")
-        identity_url = thumbnail_url if isinstance(thumbnail_url, str) else image_url
-
-        if not isinstance(identity_url, str) or identity_url in seen_urls:
-            continue
-
-        seen_urls.add(identity_url)
-        unique_candidates.append(candidate)
-
-        if len(unique_candidates) >= verification_limit:
-            break
-
-    verified: list[ImageResult] = []
-
-    if unique_candidates:
-        worker_count = min(MAX_VERIFICATION_WORKERS, len(unique_candidates))
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            for result in executor.map(verify_candidate, unique_candidates):
-                if result is None:
-                    continue
-
-                verified.append(result)
-                if len(verified) >= limit:
-                    break
-
     return ImageSearchResponse(
         query=query,
-        results=verified,
+        results=search_images(query, limit),
     )

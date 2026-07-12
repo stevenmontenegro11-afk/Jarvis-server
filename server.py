@@ -1,21 +1,43 @@
+import base64
+import binascii
 import os
+import re
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel, Field
-from server_jobs import router as jobs_router
-from image_search import router as image_search_router
 
-app = FastAPI(title="Jarvis Server", version="1.1.0")
+from image_search import meaningful_query_terms, router as image_search_router
+from image_search import search_images
+from server_jobs import router as jobs_router
+
+app = FastAPI(title="Jarvis Server", version="1.2.0")
 
 app.include_router(jobs_router)
 app.include_router(image_search_router)
 
 TEXT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6")
+IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+GENERATED_IMAGE_DIR = Path(
+    os.getenv("JARVIS_GENERATED_IMAGE_DIR", "/tmp/jarvis-generated-images")
+)
+GENERATED_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
 client = OpenAI()
+
+IMAGE_REQUEST_PATTERN = re.compile(
+    r"(?:\b(?:show|find|get|give|display|search|send)\b.*\b(?:image|picture|photo|photograph)\b)"
+    r"|(?:\b(?:image|picture|photo|photograph)\b.*\b(?:of|showing|for)\b)"
+    r"|(?:\bwhat\b.*\blook(?:s)? like\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+GENERATED_IMAGE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}\.png$")
 
 
 class Message(BaseModel):
@@ -32,14 +54,121 @@ class ChatResponse(BaseModel):
 
 
 def needs_live_search(text: str) -> bool:
-    text = text.lower()
+    lowered = text.lower()
     live_terms = (
-        "today", "yesterday", "tomorrow", "latest", "current", "right now",
-        "live", "score", "won", "winner", "game", "match", "schedule",
-        "standings", "news", "weather", "price", "ufc", "soccer",
-        "football", "nba", "nfl", "mlb", "nhl", "world cup"
+        "today",
+        "yesterday",
+        "tomorrow",
+        "latest",
+        "current",
+        "right now",
+        "live",
+        "score",
+        "won",
+        "winner",
+        "game",
+        "match",
+        "schedule",
+        "standings",
+        "news",
+        "weather",
+        "price",
+        "ufc",
+        "soccer",
+        "football",
+        "nba",
+        "nfl",
+        "mlb",
+        "nhl",
+        "world cup",
     )
-    return any(term in text for term in live_terms)
+    return any(term in lowered for term in live_terms)
+
+
+def is_image_request(text: str) -> bool:
+    return bool(IMAGE_REQUEST_PATTERN.search(text))
+
+
+def image_subject(text: str) -> str:
+    terms = meaningful_query_terms(text)
+    return " ".join(terms).strip() or text.strip()
+
+
+def markdown_safe_label(value: str) -> str:
+    cleaned = re.sub(r"[\[\]\r\n]+", " ", value).strip()
+    return cleaned or "Requested image"
+
+
+def image_reply(
+    title: str,
+    image_url: str,
+    source_page_url: str | None = None,
+    source_name: str | None = None,
+    generated: bool = False,
+) -> str:
+    safe_title = markdown_safe_label(title)
+    lines = [
+        f"![{safe_title}](<{image_url}>)",
+        "",
+        f"[Open image directly](<{image_url}>)",
+    ]
+
+    if source_page_url and source_name:
+        safe_source = markdown_safe_label(source_name)
+        lines[-1] += f" · [Source: {safe_source}](<{source_page_url}>)"
+    elif generated:
+        lines[-1] += " · Generated because image search returned no usable result."
+
+    return "\n".join(lines)
+
+
+def generate_image(prompt: str, request: Request) -> tuple[str, str] | None:
+    try:
+        response = client.images.generate(
+            model=IMAGE_MODEL,
+            prompt=(
+                "Create a clear, high-quality image of the following requested subject. "
+                "Keep the result visually faithful to the subject and avoid adding text: "
+                f"{prompt}"
+            ),
+            size="1024x1024",
+            n=1,
+        )
+    except Exception:
+        return None
+
+    data = getattr(response, "data", None)
+    if not data:
+        return None
+
+    image_data = data[0]
+    remote_url = getattr(image_data, "url", None)
+    if isinstance(remote_url, str) and remote_url.startswith(("http://", "https://")):
+        return remote_url, prompt
+
+    encoded_image = getattr(image_data, "b64_json", None)
+    if not isinstance(encoded_image, str) or not encoded_image:
+        return None
+
+    try:
+        decoded_image = base64.b64decode(encoded_image, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+
+    if not decoded_image:
+        return None
+
+    image_id = f"{uuid.uuid4().hex}.png"
+    image_path = GENERATED_IMAGE_DIR / image_id
+    try:
+        image_path.write_bytes(decoded_image)
+    except OSError:
+        return None
+
+    generated_url = str(
+        request.url_for("generated_image", image_id=image_id)
+    )
+    return generated_url, prompt
 
 
 @app.get("/health")
@@ -52,18 +181,54 @@ def health():
     }
 
 
+@app.get("/generated-images/{image_id}", name="generated_image")
+def generated_image(image_id: str):
+    if not GENERATED_IMAGE_ID_PATTERN.fullmatch(image_id):
+        raise HTTPException(status_code=404, detail="Image not found.")
+
+    image_path = GENERATED_IMAGE_DIR / image_id
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found.")
+
+    return FileResponse(
+        path=image_path,
+        media_type="image/png",
+        filename=image_id,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
+def chat(chat_request: ChatRequest, request: Request):
     try:
+        latest_message = chat_request.messages[-1].content
 
+        if is_image_request(latest_message):
+            subject = image_subject(latest_message)
+            results = search_images(subject, limit=3)
 
+            if results:
+                result = results[0]
+                return ChatResponse(
+                    reply=image_reply(
+                        title=result.title,
+                        image_url=str(result.image_url),
+                        source_page_url=str(result.source_page_url),
+                        source_name=result.source_name,
+                    )
+                )
 
+            generated = generate_image(subject, request)
+            if generated is not None:
+                generated_url, generated_title = generated
+                return ChatResponse(
+                    reply=image_reply(
+                        title=generated_title,
+                        image_url=generated_url,
+                        generated=True,
+                    )
+                )
 
-
-
-
-        
-        latest_message = request.messages[-1].content
         phoenix_now = datetime.now(ZoneInfo("America/Phoenix"))
         tools = [{"type": "web_search"}]
 
@@ -77,12 +242,14 @@ def chat(request: ChatRequest):
                 "Personalization must come only from the current user's conversation, account profile, permissions, and memory. "
                 "Use web search whenever external, current, local, visual, uncertain, or rapidly changing information may help. "
                 "Use web search for news, sports, schedules, weather, prices, products, businesses, public figures, locations, images, and recent events. "
-                "For image requests, search the exact requested subject, verify that the source identifies the subject, and never invent a caption or show an unrelated image. "
+                "For image requests, identify the requested subject rather than requiring source metadata to match the user's entire sentence. "
+                "Only provide a relevant image from a reputable source and never invent a caption or show an unrelated image. "
                 "Never claim an action was completed unless a connected tool actually completed and verified it. "
+                f"The current time in America/Phoenix is {phoenix_now.isoformat()}."
             ),
             input=[
                 {"role": message.role, "content": message.content}
-                for message in request.messages
+                for message in chat_request.messages
             ],
             tools=tools,
         )
