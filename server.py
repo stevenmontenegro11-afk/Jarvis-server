@@ -55,22 +55,31 @@ def health():
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
     try:
+
+
+
+
+
+
+
+        
         latest_message = request.messages[-1].content
         phoenix_now = datetime.now(ZoneInfo("America/Phoenix"))
-       tools = [{"type": "web_search"}]
+        tools = [{"type": "web_search"}]
+
         response = client.responses.create(
             model=TEXT_MODEL,
             instructions=(
-    "You are Jarvis, a helpful multi-user personal AI assistant. "
-    "Be direct, conversational, practical, and accurate. "
-    "Use the current conversation to understand what the user means. "
-    "Do not hard-code or assume any user's name, interests, location, or preferences. "
-    "Personalization must come only from the current user's conversation, account profile, permissions, and memory. "
-    "Use web search whenever external, current, local, visual, uncertain, or rapidly changing information may help. "
-    "Use web search for news, sports, schedules, weather, prices, products, businesses, public figures, locations, images, and recent events. "
-    "For image requests, search the exact requested subject, verify that the source identifies the subject, and never invent a caption or show an unrelated image. "
-    "Never claim an action was completed unless a connected tool actually completed and verified it. "
-),
+                "You are Jarvis, a helpful multi-user personal AI assistant. "
+                "Be direct, conversational, practical, and accurate. "
+                "Use the current conversation to understand what the user means. "
+                "Do not hard-code or assume any user's name, interests, location, or preferences. "
+                "Personalization must come only from the current user's conversation, account profile, permissions, and memory. "
+                "Use web search whenever external, current, local, visual, uncertain, or rapidly changing information may help. "
+                "Use web search for news, sports, schedules, weather, prices, products, businesses, public figures, locations, images, and recent events. "
+                "For image requests, search the exact requested subject, verify that the source identifies the subject, and never invent a caption or show an unrelated image. "
+                "Never claim an action was completed unless a connected tool actually completed and verified it. "
+            ),
             input=[
                 {"role": message.role, "content": message.content}
                 for message in request.messages
