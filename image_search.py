@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import math
 import re
 import unicodedata
 from collections.abc import Iterable
@@ -17,7 +16,7 @@ router = APIRouter(tags=["image-search"])
 OPENVERSE_URL = "https://api.openverse.org/v1/images/"
 WIKIMEDIA_URL = "https://commons.wikimedia.org/w/api.php"
 HEADERS = {
-    "User-Agent": "JarvisImageSearch/1.4 (FastAPI image search service)",
+    "User-Agent": "JarvisImageSearch/1.5 (FastAPI image search service)",
     "Accept": "application/json, image/avif, image/webp, image/apng, image/svg+xml, image/*, */*;q=0.8",
 }
 PROVIDER_TIMEOUT = (3.05, 6.0)
@@ -63,7 +62,9 @@ QUERY_FILLER_WORDS = frozenset(
         "please",
         "search",
         "see",
+        "send",
         "show",
+        "showing",
         "the",
         "to",
         "want",
@@ -120,18 +121,25 @@ def normalize_tokens(value: str) -> set[str]:
 
 def meaningful_query_terms(query: str) -> list[str]:
     terms = normalized_token_list(query)
-    selected = [term for term in terms if term not in QUERY_FILLER_WORDS] or terms
-    unique: list[str] = []
+    meaningful_terms = [term for term in terms if term not in QUERY_FILLER_WORDS]
+    selected_terms = meaningful_terms or terms
+
+    unique_terms: list[str] = []
     seen: set[str] = set()
-    for term in selected:
-        if term not in seen:
-            seen.add(term)
-            unique.append(term)
-    return unique
+    for term in selected_terms:
+        if term in seen:
+            continue
+        seen.add(term)
+        unique_terms.append(term)
+    return unique_terms
 
 
 def meaningful_query_words(query: str) -> set[str]:
     return set(meaningful_query_terms(query))
+
+
+def normalized_meaningful_query(query: str) -> str:
+    return " ".join(meaningful_query_terms(query))
 
 
 def metadata_values(value: Any) -> Iterable[str]:
@@ -170,14 +178,17 @@ def token_variants(token: str) -> set[str]:
 
 
 def query_term_matches_metadata(term: str, metadata_words: set[str]) -> bool:
-    variants = token_variants(term)
-    return any(variants.intersection(token_variants(word)) for word in metadata_words)
+    term_variants = token_variants(term)
+    return any(
+        term_variants.intersection(token_variants(metadata_word))
+        for metadata_word in metadata_words
+    )
 
 
 def matching_term_count(text: str, query_terms: list[str]) -> int:
-    words = normalize_tokens(text)
+    metadata_words = normalize_tokens(text)
     return sum(
-        query_term_matches_metadata(term, words)
+        query_term_matches_metadata(term, metadata_words)
         for term in query_terms
     )
 
@@ -189,8 +200,7 @@ def relevance_score(candidate: dict[str, Any], query_terms: list[str]) -> int | 
     metadata_matches = matching_term_count(
         str(candidate.get("metadata_text", "")), query_terms
     )
-    minimum_matches = max(1, math.ceil(len(query_terms) * 0.5))
-    if metadata_matches < minimum_matches:
+    if metadata_matches != len(query_terms):
         return None
 
     title_text = str(candidate.get("title_text", ""))
@@ -208,10 +218,9 @@ def relevance_score(candidate: dict[str, Any], query_terms: list[str]) -> int | 
         + tag_matches * 8
         + description_matches * 5
         + creator_matches * 2
+        + 15
     )
     normalized_title = normalized_token_list(title_text)
-    if metadata_matches == len(query_terms):
-        score += 15
     if all(term in normalized_title for term in query_terms):
         score += 15
     if " ".join(query_terms) in " ".join(normalized_title):
@@ -247,7 +256,12 @@ def url_is_working_image(url: str) -> bool:
         if response.status_code not in (200, 206):
             return False
 
-        content_type = response.headers.get("content-type", "").split(";", 1)[0].lower().strip()
+        content_type = (
+            response.headers.get("content-type", "")
+            .split(";", 1)[0]
+            .lower()
+            .strip()
+        )
         if content_type in DISPLAYABLE_IMAGE_TYPES:
             return True
         if content_type.startswith("image/"):
@@ -286,6 +300,7 @@ def search_openverse(query: str, limit: int) -> list[dict[str, Any]]:
     for provider_rank, item in enumerate(provider_results):
         if not isinstance(item, dict):
             continue
+
         image_url = item.get("url")
         source_page = item.get("foreign_landing_url")
         thumbnail = item.get("thumbnail")
@@ -475,15 +490,19 @@ def search_images(query: str, limit: int = 5) -> list[ImageResult]:
 
     safe_limit = min(limit, 10)
     query_terms = meaningful_query_terms(cleaned_query)
-    provider_query = " ".join(query_terms) or cleaned_query
+    if not query_terms:
+        return []
+
+    provider_query = " ".join(query_terms)
     candidates = run_provider_searches(provider_query, safe_limit)
 
     relevant: list[dict[str, Any]] = []
     for candidate in candidates:
         score = relevance_score(candidate, query_terms)
-        if score is not None:
-            candidate["relevance_score"] = score
-            relevant.append(candidate)
+        if score is None:
+            continue
+        candidate["relevance_score"] = score
+        relevant.append(candidate)
 
     relevant.sort(
         key=lambda candidate: (
@@ -543,7 +562,15 @@ def image_search(
             status_code=400,
             detail="Image search query cannot be empty.",
         )
+
+    meaningful_query = normalized_meaningful_query(query)
+    if not meaningful_query:
+        raise HTTPException(
+            status_code=400,
+            detail="Image search query must include a meaningful subject.",
+        )
+
     return ImageSearchResponse(
-        query=query,
-        results=search_images(query, limit),
+        query=meaningful_query,
+        results=search_images(meaningful_query, limit),
     )
