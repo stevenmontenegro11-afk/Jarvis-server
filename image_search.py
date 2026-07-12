@@ -16,17 +16,24 @@ router = APIRouter(tags=["image-search"])
 OPENVERSE_URL = "https://api.openverse.org/v1/images/"
 WIKIMEDIA_URL = "https://commons.wikimedia.org/w/api.php"
 HEADERS = {
-    "User-Agent": "JarvisImageSearch/1.5 (FastAPI image search service)",
+    "User-Agent": "JarvisImageSearch/1.6 (FastAPI image search service)",
     "Accept": "application/json, image/avif, image/webp, image/apng, image/svg+xml, image/*, */*;q=0.8",
 }
 PROVIDER_TIMEOUT = (3.05, 6.0)
 VERIFICATION_TIMEOUT = (2.5, 4.0)
 MAX_PROVIDER_RESULTS = 40
 MAX_VERIFICATION_WORKERS = 8
-MAX_VERIFICATION_CANDIDATES = 12
+MAX_VERIFICATION_CANDIDATES = 36
+VERIFICATION_BATCH_SIZE = 12
 
 TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+REQUEST_PHRASE_PATTERN = re.compile(
+    r"\b(?:show|find|give|get|send)\s+me\b"
+    r"|\b(?:show|find|give|get|send|display|search)\b"
+    r"|\b(?:picture|photo|photograph|image)s?\s+of\b",
+    re.IGNORECASE,
+)
 QUERY_FILLER_WORDS = frozenset(
     {
         "a",
@@ -120,13 +127,19 @@ def normalize_tokens(value: str) -> set[str]:
 
 
 def meaningful_query_terms(query: str) -> list[str]:
-    terms = normalized_token_list(query)
+    phrase_cleaned_query = REQUEST_PHRASE_PATTERN.sub(" ", query)
+    terms = normalized_token_list(phrase_cleaned_query)
     meaningful_terms = [term for term in terms if term not in QUERY_FILLER_WORDS]
-    selected_terms = meaningful_terms or terms
+
+    if not meaningful_terms:
+        original_terms = normalized_token_list(query)
+        meaningful_terms = [
+            term for term in original_terms if term not in QUERY_FILLER_WORDS
+        ]
 
     unique_terms: list[str] = []
     seen: set[str] = set()
-    for term in selected_terms:
+    for term in meaningful_terms:
         if term in seen:
             continue
         seen.add(term)
@@ -163,9 +176,7 @@ def metadata_values(value: Any) -> Iterable[str]:
 
 
 def build_metadata_text(*values: Any) -> str:
-    return " ".join(
-        text for value in values for text in metadata_values(value)
-    )
+    return " ".join(text for value in values for text in metadata_values(value))
 
 
 def token_variants(token: str) -> set[str]:
@@ -188,43 +199,53 @@ def query_term_matches_metadata(term: str, metadata_words: set[str]) -> bool:
 def matching_term_count(text: str, query_terms: list[str]) -> int:
     metadata_words = normalize_tokens(text)
     return sum(
-        query_term_matches_metadata(term, metadata_words)
-        for term in query_terms
+        query_term_matches_metadata(term, metadata_words) for term in query_terms
     )
 
 
-def relevance_score(candidate: dict[str, Any], query_terms: list[str]) -> int | None:
+def phrase_occurs(text: str, query_terms: list[str]) -> bool:
+    if not text or not query_terms:
+        return False
+    normalized_text = " ".join(normalized_token_list(text))
+    return " ".join(query_terms) in normalized_text
+
+
+def relevance_score(candidate: dict[str, Any], query_terms: list[str]) -> int:
     if not query_terms:
-        return None
+        return 0
 
-    metadata_matches = matching_term_count(
-        str(candidate.get("metadata_text", "")), query_terms
-    )
-    if metadata_matches != len(query_terms):
-        return None
-
+    metadata_text = str(candidate.get("metadata_text", ""))
     title_text = str(candidate.get("title_text", ""))
     tag_text = str(candidate.get("tag_text", ""))
     description_text = str(candidate.get("description_text", ""))
     creator_text = str(candidate.get("creator_text", ""))
+
+    metadata_matches = matching_term_count(metadata_text, query_terms)
     title_matches = matching_term_count(title_text, query_terms)
     tag_matches = matching_term_count(tag_text, query_terms)
     description_matches = matching_term_count(description_text, query_terms)
     creator_matches = matching_term_count(creator_text, query_terms)
 
     score = (
-        metadata_matches * 3
-        + title_matches * 15
-        + tag_matches * 8
-        + description_matches * 5
-        + creator_matches * 2
-        + 15
+        metadata_matches * 4
+        + title_matches * 18
+        + tag_matches * 10
+        + description_matches * 6
+        + creator_matches
     )
-    normalized_title = normalized_token_list(title_text)
-    if all(term in normalized_title for term in query_terms):
+    score += round(20 * metadata_matches / len(query_terms))
+
+    if metadata_matches == len(query_terms):
         score += 15
-    if " ".join(query_terms) in " ".join(normalized_title):
-        score += 30
+    if phrase_occurs(metadata_text, query_terms):
+        score += 15
+    if phrase_occurs(title_text, query_terms):
+        score += 35
+    elif phrase_occurs(tag_text, query_terms):
+        score += 20
+    elif phrase_occurs(description_text, query_terms):
+        score += 10
+
     return score
 
 
@@ -323,7 +344,9 @@ def search_openverse(query: str, limit: int) -> list[dict[str, Any]]:
                 "source_page_url": source_page,
                 "source_name": str(item.get("source") or "Openverse"),
                 "creator": creator if isinstance(creator, str) else None,
-                "license": str(item["license"]) if item.get("license") is not None else None,
+                "license": str(item["license"])
+                if item.get("license") is not None
+                else None,
                 "metadata_text": build_metadata_text(
                     title_text, tag_text, description_text, creator_text
                 ),
@@ -421,13 +444,16 @@ def search_wikimedia(query: str, limit: int) -> list[dict[str, Any]]:
             {
                 "title": title,
                 "image_url": image_url,
-                "thumbnail_url": thumbnail_url if isinstance(thumbnail_url, str) else image_url,
+                "thumbnail_url": thumbnail_url
+                if isinstance(thumbnail_url, str)
+                else image_url,
                 "source_page_url": source_page,
                 "source_name": "Wikimedia Commons",
                 "creator": creator or None,
                 "license": build_metadata_text(
                     metadata_field(extmetadata, "LicenseShortName")
-                ) or None,
+                )
+                or None,
                 "metadata_text": build_metadata_text(
                     title_text, tags, description, creator
                 ),
@@ -483,6 +509,30 @@ def verify_candidate(candidate: dict[str, Any]) -> ImageResult | None:
         return None
 
 
+def verify_candidate_batch(
+    candidates: list[dict[str, Any]],
+) -> list[tuple[int, ImageResult]]:
+    if not candidates:
+        return []
+
+    verified: list[tuple[int, ImageResult]] = []
+    worker_count = min(MAX_VERIFICATION_WORKERS, len(candidates))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_candidates = {
+            executor.submit(verify_candidate, candidate): candidate
+            for candidate in candidates
+        }
+        for future in as_completed(future_candidates):
+            candidate = future_candidates[future]
+            try:
+                result = future.result()
+            except Exception:
+                result = None
+            if result is not None:
+                verified.append((candidate["verification_rank"], result))
+    return verified
+
+
 def search_images(query: str, limit: int = 5) -> list[ImageResult]:
     cleaned_query = query.strip()
     if not cleaned_query or limit < 1:
@@ -496,56 +546,40 @@ def search_images(query: str, limit: int = 5) -> list[ImageResult]:
     provider_query = " ".join(query_terms)
     candidates = run_provider_searches(provider_query, safe_limit)
 
-    relevant: list[dict[str, Any]] = []
+    ranked: list[dict[str, Any]] = []
     for candidate in candidates:
-        score = relevance_score(candidate, query_terms)
-        if score is None:
-            continue
-        candidate["relevance_score"] = score
-        relevant.append(candidate)
+        candidate["relevance_score"] = relevance_score(candidate, query_terms)
+        ranked.append(candidate)
 
-    relevant.sort(
+    ranked.sort(
         key=lambda candidate: (
             -candidate["relevance_score"],
-            candidate.get("provider_priority", 10),
             candidate.get("provider_rank", 1_000_000),
+            candidate.get("provider_priority", 10),
         )
     )
 
     unique: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
-    verification_limit = min(
-        MAX_VERIFICATION_CANDIDATES,
-        max(safe_limit * 2, safe_limit + 3),
-    )
-    for candidate in relevant:
+    for candidate in ranked:
         identity = candidate.get("thumbnail_url") or candidate.get("image_url")
         if not isinstance(identity, str) or identity in seen_urls:
             continue
         seen_urls.add(identity)
         candidate["verification_rank"] = len(unique)
         unique.append(candidate)
-        if len(unique) >= verification_limit:
+        if len(unique) >= MAX_VERIFICATION_CANDIDATES:
             break
 
     if not unique:
         return []
 
     verified: list[tuple[int, ImageResult]] = []
-    worker_count = min(MAX_VERIFICATION_WORKERS, len(unique))
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        future_candidates = {
-            executor.submit(verify_candidate, candidate): candidate
-            for candidate in unique
-        }
-        for future in as_completed(future_candidates):
-            candidate = future_candidates[future]
-            try:
-                result = future.result()
-            except Exception:
-                result = None
-            if result is not None:
-                verified.append((candidate["verification_rank"], result))
+    for batch_start in range(0, len(unique), VERIFICATION_BATCH_SIZE):
+        batch = unique[batch_start : batch_start + VERIFICATION_BATCH_SIZE]
+        verified.extend(verify_candidate_batch(batch))
+        if len(verified) >= safe_limit:
+            break
 
     verified.sort(key=lambda item: item[0])
     return [result for _, result in verified[:safe_limit]]
