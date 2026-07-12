@@ -16,22 +16,22 @@ router = APIRouter(tags=["image-search"])
 OPENVERSE_URL = "https://api.openverse.org/v1/images/"
 WIKIMEDIA_URL = "https://commons.wikimedia.org/w/api.php"
 HEADERS = {
-    "User-Agent": "JarvisImageSearch/1.6 (FastAPI image search service)",
+    "User-Agent": "JarvisImageSearch/1.7 (FastAPI image search service)",
     "Accept": "application/json, image/avif, image/webp, image/apng, image/svg+xml, image/*, */*;q=0.8",
 }
-PROVIDER_TIMEOUT = (3.05, 6.0)
-VERIFICATION_TIMEOUT = (2.5, 4.0)
+PROVIDER_TIMEOUT = (3.05, 8.0)
+VERIFICATION_TIMEOUT = (2.5, 5.0)
 MAX_PROVIDER_RESULTS = 40
 MAX_VERIFICATION_WORKERS = 8
-MAX_VERIFICATION_CANDIDATES = 36
-VERIFICATION_BATCH_SIZE = 12
+MAX_VERIFICATION_CANDIDATES = 40
+VERIFICATION_BATCH_SIZE = 10
 
 TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 REQUEST_PHRASE_PATTERN = re.compile(
     r"\b(?:show|find|give|get|send)\s+me\b"
-    r"|\b(?:show|find|give|get|send|display|search)\b"
-    r"|\b(?:picture|photo|photograph|image)s?\s+of\b",
+    r"|\b(?:picture|photo|photograph|image)s?\s+of\b"
+    r"|\b(?:show|find|give|get|send|display|search)\b",
     re.IGNORECASE,
 )
 QUERY_FILLER_WORDS = frozenset(
@@ -132,9 +132,10 @@ def meaningful_query_terms(query: str) -> list[str]:
     meaningful_terms = [term for term in terms if term not in QUERY_FILLER_WORDS]
 
     if not meaningful_terms:
-        original_terms = normalized_token_list(query)
         meaningful_terms = [
-            term for term in original_terms if term not in QUERY_FILLER_WORDS
+            term
+            for term in normalized_token_list(query)
+            if term not in QUERY_FILLER_WORDS
         ]
 
     unique_terms: list[str] = []
@@ -183,6 +184,8 @@ def token_variants(token: str) -> set[str]:
     variants = {token}
     if len(token) > 4 and token.endswith("ies"):
         variants.add(f"{token[:-3]}y")
+    if len(token) > 3 and token.endswith("es"):
+        variants.add(token[:-2])
     if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
         variants.add(token[:-1])
     return variants
@@ -207,7 +210,8 @@ def phrase_occurs(text: str, query_terms: list[str]) -> bool:
     if not text or not query_terms:
         return False
     normalized_text = " ".join(normalized_token_list(text))
-    return " ".join(query_terms) in normalized_text
+    normalized_phrase = " ".join(query_terms)
+    return normalized_phrase in normalized_text
 
 
 def relevance_score(candidate: dict[str, Any], query_terms: list[str]) -> int:
@@ -227,24 +231,24 @@ def relevance_score(candidate: dict[str, Any], query_terms: list[str]) -> int:
     creator_matches = matching_term_count(creator_text, query_terms)
 
     score = (
-        metadata_matches * 4
-        + title_matches * 18
-        + tag_matches * 10
-        + description_matches * 6
+        metadata_matches * 5
+        + title_matches * 20
+        + tag_matches * 11
+        + description_matches * 7
         + creator_matches
     )
-    score += round(20 * metadata_matches / len(query_terms))
+    score += round(25 * metadata_matches / len(query_terms))
 
     if metadata_matches == len(query_terms):
-        score += 15
+        score += 18
     if phrase_occurs(metadata_text, query_terms):
         score += 15
     if phrase_occurs(title_text, query_terms):
-        score += 35
+        score += 40
     elif phrase_occurs(tag_text, query_terms):
-        score += 20
+        score += 24
     elif phrase_occurs(description_text, query_terms):
-        score += 10
+        score += 12
 
     return score
 
@@ -256,7 +260,7 @@ def payload_looks_like_image(payload: bytes) -> bool:
         payload.startswith(b"\xff\xd8\xff")
         or payload.startswith(b"\x89PNG\r\n\x1a\n")
         or payload.startswith((b"GIF87a", b"GIF89a"))
-        or payload.startswith(b"RIFF") and payload[8:12] == b"WEBP"
+        or (payload.startswith(b"RIFF") and payload[8:12] == b"WEBP")
         or b"<svg" in lowered
     )
 
@@ -303,7 +307,7 @@ def search_openverse(query: str, limit: int) -> list[dict[str, Any]]:
             OPENVERSE_URL,
             params={
                 "q": query,
-                "page_size": min(max(limit * 4, 20), MAX_PROVIDER_RESULTS),
+                "page_size": min(max(limit * 5, 24), MAX_PROVIDER_RESULTS),
             },
             headers=HEADERS,
             timeout=PROVIDER_TIMEOUT,
@@ -381,7 +385,7 @@ def search_wikimedia(query: str, limit: int) -> list[dict[str, Any]]:
                 "generator": "search",
                 "gsrsearch": query,
                 "gsrnamespace": 6,
-                "gsrlimit": min(max(limit * 4, 20), MAX_PROVIDER_RESULTS),
+                "gsrlimit": min(max(limit * 5, 24), MAX_PROVIDER_RESULTS),
                 "prop": "imageinfo",
                 "iiprop": "url|mime|extmetadata",
                 "iiurlwidth": 1200,
@@ -397,8 +401,11 @@ def search_wikimedia(query: str, limit: int) -> list[dict[str, Any]]:
 
     query_data = data.get("query", {}) if isinstance(data, dict) else {}
     pages = query_data.get("pages", []) if isinstance(query_data, dict) else []
-    page_values = pages.values() if isinstance(pages, dict) else pages
-    if not isinstance(page_values, Iterable):
+    if isinstance(pages, dict):
+        page_values = list(pages.values())
+    elif isinstance(pages, list):
+        page_values = pages
+    else:
         return []
 
     ordered_pages = sorted(
@@ -484,6 +491,38 @@ def run_provider_searches(query: str, limit: int) -> list[dict[str, Any]]:
     return results
 
 
+def rank_candidates(
+    candidates: list[dict[str, Any]], query_terms: list[str]
+) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for candidate in candidates:
+        candidate["relevance_score"] = relevance_score(candidate, query_terms)
+        ranked.append(candidate)
+
+    ranked.sort(
+        key=lambda candidate: (
+            -candidate["relevance_score"],
+            candidate.get("provider_rank", 1_000_000),
+            candidate.get("provider_priority", 10),
+        )
+    )
+
+    unique: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for candidate in ranked:
+        original_url = candidate.get("image_url")
+        thumbnail_url = candidate.get("thumbnail_url")
+        identity = original_url or thumbnail_url
+        if not isinstance(identity, str) or identity in seen_urls:
+            continue
+        seen_urls.add(identity)
+        candidate["verification_rank"] = len(unique)
+        unique.append(candidate)
+        if len(unique) >= MAX_VERIFICATION_CANDIDATES:
+            break
+    return unique
+
+
 def verify_candidate(candidate: dict[str, Any]) -> ImageResult | None:
     original_url = candidate.get("image_url")
     thumbnail_url = candidate.get("thumbnail_url")
@@ -533,6 +572,20 @@ def verify_candidate_batch(
     return verified
 
 
+def verify_ranked_candidates(
+    candidates: list[dict[str, Any]], limit: int
+) -> list[ImageResult]:
+    verified: list[tuple[int, ImageResult]] = []
+    for batch_start in range(0, len(candidates), VERIFICATION_BATCH_SIZE):
+        batch = candidates[batch_start : batch_start + VERIFICATION_BATCH_SIZE]
+        verified.extend(verify_candidate_batch(batch))
+        if len(verified) >= limit:
+            break
+
+    verified.sort(key=lambda item: item[0])
+    return [result for _, result in verified[:limit]]
+
+
 def search_images(query: str, limit: int = 5) -> list[ImageResult]:
     cleaned_query = query.strip()
     if not cleaned_query or limit < 1:
@@ -545,44 +598,17 @@ def search_images(query: str, limit: int = 5) -> list[ImageResult]:
 
     provider_query = " ".join(query_terms)
     candidates = run_provider_searches(provider_query, safe_limit)
+    ranked = rank_candidates(candidates, query_terms)
+    results = verify_ranked_candidates(ranked, safe_limit)
+    if results or len(query_terms) == 1:
+        return results
 
-    ranked: list[dict[str, Any]] = []
-    for candidate in candidates:
-        candidate["relevance_score"] = relevance_score(candidate, query_terms)
-        ranked.append(candidate)
+    fallback_candidates: list[dict[str, Any]] = []
+    for term in query_terms:
+        fallback_candidates.extend(run_provider_searches(term, safe_limit))
 
-    ranked.sort(
-        key=lambda candidate: (
-            -candidate["relevance_score"],
-            candidate.get("provider_rank", 1_000_000),
-            candidate.get("provider_priority", 10),
-        )
-    )
-
-    unique: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
-    for candidate in ranked:
-        identity = candidate.get("thumbnail_url") or candidate.get("image_url")
-        if not isinstance(identity, str) or identity in seen_urls:
-            continue
-        seen_urls.add(identity)
-        candidate["verification_rank"] = len(unique)
-        unique.append(candidate)
-        if len(unique) >= MAX_VERIFICATION_CANDIDATES:
-            break
-
-    if not unique:
-        return []
-
-    verified: list[tuple[int, ImageResult]] = []
-    for batch_start in range(0, len(unique), VERIFICATION_BATCH_SIZE):
-        batch = unique[batch_start : batch_start + VERIFICATION_BATCH_SIZE]
-        verified.extend(verify_candidate_batch(batch))
-        if len(verified) >= safe_limit:
-            break
-
-    verified.sort(key=lambda item: item[0])
-    return [result for _, result in verified[:safe_limit]]
+    fallback_ranked = rank_candidates(fallback_candidates, query_terms)
+    return verify_ranked_candidates(fallback_ranked, safe_limit)
 
 
 @router.get("/image-search", response_model=ImageSearchResponse)
