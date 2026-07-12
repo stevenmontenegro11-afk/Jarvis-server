@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 from server_jobs import router as jobs_router
-
+from image_search import router as image_search_router
 
 app = FastAPI(title="Jarvis Server", version="1.1.0")
 
